@@ -315,6 +315,9 @@ fn invalidate_cell_dependents(
                 // cell dependency has been read, so the task needs to be made stale
                 // (which implies dirty).
                 make_stale = true;
+                // The other keys can't change the outcome (the dirty cause below is built from
+                // all `keys`).
+                break;
             }
             // Otherwise the cell dependency has been removed, so the task doesn't depend
             // on this key anymore and it doesn't contribute to the invalidation.

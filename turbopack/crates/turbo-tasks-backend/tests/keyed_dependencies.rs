@@ -20,7 +20,7 @@ use turbo_tasks::{ResolvedVc, State, TaskId, TransientInstance, TryJoinIterExt, 
 use crate::util::create_tt_with_workers;
 
 /// Reader executions, per test (tests run concurrently in one process).
-static EXECUTIONS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static EXECUTIONS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
 fn executions(test: u32) -> u64 {
     EXECUTIONS[test as usize].load(Ordering::SeqCst)
@@ -495,6 +495,56 @@ async fn keyed_readers_collected_by_gc_remove_their_edges() {
     .await
     .unwrap();
     tt.stop_and_wait().await;
+}
+
+/// A reader depending on many keys that all change at once is invalidated (and re-executed) exactly
+/// once, with the new values.
+async fn check_many_changed_keys_reexecute_once(test: u32, mode: Mode, name: &str) {
+    let (n, m) = (1, 64);
+    let (tt, _dir) = create_tt_with_workers(name, 4);
+    turbo_tasks::run_once(tt.clone(), async move {
+        let inputs_op = create_inputs(test);
+        let inputs_vc = inputs_op.resolve().strongly_consistent().await?;
+        let inputs = inputs_op.read_strongly_consistent().await?;
+        let root = readers(inputs_vc, test, n, m, mode as u8);
+        assert_eq!(
+            *root.read_strongly_consistent().await?,
+            expected(n, m, 0, 0)
+        );
+        for values in 1..=3 {
+            let before = executions(test);
+            inputs.values.set(values);
+            assert_eq!(
+                *root.read_strongly_consistent().await?,
+                expected(n, m, values, 0)
+            );
+            assert_eq!(executions(test) - before, 1);
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap();
+    tt.stop_and_wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyed_reader_many_changed_keys_reexecute_once() {
+    check_many_changed_keys_reexecute_once(
+        8,
+        Mode::KeyedReader,
+        "keyed_reader_many_changed_keys_reexecute_once",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyed_get_many_changed_keys_reexecute_once() {
+    check_many_changed_keys_reexecute_once(
+        9,
+        Mode::Get,
+        "keyed_get_many_changed_keys_reexecute_once",
+    )
+    .await;
 }
 
 /// Persistent and transient readers depend on the same keys of a persistent cell, whose owner is
