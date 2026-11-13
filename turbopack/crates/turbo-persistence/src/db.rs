@@ -8,7 +8,7 @@ use std::{
     ops::RangeInclusive,
     path::{Path, PathBuf},
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -46,7 +46,7 @@ use crate::{
     key::{StoreKey, hash_key},
     lookup_entry::{IterValue, LookupEntry, LookupValue},
     merge_iter::MergeIter,
-    meta_file::{MetaEntryFlags, MetaFile, MetaLookupResult, StaticSortedFileRange},
+    meta_file::{EagerSstOpen, MetaEntryFlags, MetaFile, MetaLookupResult, StaticSortedFileRange},
     meta_file_builder::MetaFileBuilder,
     parallel_scheduler::ParallelScheduler,
     rc_bytes::RcBytes,
@@ -313,6 +313,25 @@ const PARALLEL_BATCH_GET_THRESHOLD: usize = 2048;
 /// that the scheduler can run at the same time, like `turbo_tasks::util::good_chunk_size`.
 const BATCH_GET_CHUNKS_PER_TASK: usize = 4;
 
+/// Eagerly opening SST files spawns up to this many background tasks per task that the scheduler
+/// can run at the same time. An open is a few dependent reads, so it waits on I/O rather than
+/// using the CPU, and more tasks than the parallelism keep more reads in flight.
+const EAGER_SST_OPEN_TASKS_PER_PARALLELISM: usize = 4;
+
+/// Counts down [`TurboPersistence::pending_eager_sst_opens`] when an eager open task is dropped:
+/// after it finishes or panics, or when the scheduler drops it without running it.
+#[cfg(test)]
+struct PendingEagerSstOpenGuard(Arc<(Mutex<usize>, parking_lot::Condvar)>);
+
+#[cfg(test)]
+impl Drop for PendingEagerSstOpenGuard {
+    fn drop(&mut self) {
+        let (pending, condvar) = &*self.0;
+        *pending.lock() -= 1;
+        condvar.notify_all();
+    }
+}
+
 /// The number of `usize` blocks that the `SmallVec` storage of [`BatchGetResolved`] holds inline:
 /// enough for the positions of 256 keys on every target.
 const BATCH_GET_RESOLVED_INLINE_BLOCKS: usize = 256 / usize::BITS as usize;
@@ -436,6 +455,10 @@ pub struct TurboPersistence<S: ParallelScheduler, const FAMILIES: usize> {
     /// Statistics for the database.
     #[cfg(feature = "stats")]
     stats: TrackedStats,
+    /// The number of background tasks spawned by [`Self::spawn_eager_sst_opens`] that haven't
+    /// finished yet, so tests can wait for them.
+    #[cfg(test)]
+    pending_eager_sst_opens: Arc<(Mutex<usize>, parking_lot::Condvar)>,
 }
 
 /// The inner state of the database.
@@ -604,7 +627,76 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
             config,
             #[cfg(feature = "stats")]
             stats: TrackedStats::default(),
+            #[cfg(test)]
+            pending_eager_sst_opens: Default::default(),
         }
+    }
+
+    /// Opens the SST files of `meta_files` that aren't open yet in the background, so that lookups
+    /// usually find them open.
+    ///
+    /// The opens are spread over several [`ParallelScheduler::spawn_blocking`] tasks that run in
+    /// parallel, and this returns without waiting for them. Newer meta files are opened first,
+    /// since lookups consult them first. See [`EagerSstOpen`] for how an open interacts with
+    /// lookups and with entries that are dropped in the meantime.
+    fn spawn_eager_sst_opens<'l>(&self, meta_files: impl DoubleEndedIterator<Item = &'l MetaFile>) {
+        let mut opens = Vec::new();
+        for meta_file in meta_files.rev() {
+            meta_file.collect_eager_sst_opens(&mut opens);
+        }
+        if opens.is_empty() {
+            return;
+        }
+        let task_count = opens.len().min(
+            self.parallel_scheduler.parallelism().max(1) * EAGER_SST_OPEN_TASKS_PER_PARALLELISM,
+        );
+        // Deal the opens out round-robin, so that every task starts with one of the newest files.
+        let mut tasks: Vec<Vec<EagerSstOpen>> = (0..task_count)
+            .map(|_| Vec::with_capacity(opens.len().div_ceil(task_count)))
+            .collect();
+        for (index, open) in opens.into_iter().enumerate() {
+            tasks[index % task_count].push(open);
+        }
+        let db_path: Arc<Path> = self.path.as_path().into();
+        #[cfg(test)]
+        {
+            *self.pending_eager_sst_opens.0.lock() += task_count;
+        }
+        for task in tasks {
+            let db_path = db_path.clone();
+            #[cfg(test)]
+            let done = PendingEagerSstOpenGuard(self.pending_eager_sst_opens.clone());
+            self.parallel_scheduler.spawn_blocking(move || {
+                #[cfg(test)]
+                let _done = done;
+                for open in task {
+                    open.run(&db_path);
+                }
+            });
+        }
+    }
+
+    /// Blocks until every background task spawned to eagerly open SST files has finished.
+    #[cfg(test)]
+    pub(crate) fn wait_for_eager_sst_opens(&self) {
+        let (pending, condvar) = &*self.pending_eager_sst_opens;
+        let mut pending = pending.lock();
+        while *pending > 0 {
+            condvar.wait(&mut pending);
+        }
+    }
+
+    /// The sequence numbers of all live SST files, each with whether it is open.
+    #[cfg(test)]
+    pub(crate) fn sst_open_states(&self) -> Vec<(u32, bool)> {
+        self.inner
+            .read()
+            .meta_files_by_family
+            .iter()
+            .flatten()
+            .flat_map(|meta| meta.entries())
+            .map(|entry| (entry.sequence_number(), entry.is_sst_open()))
+            .collect()
     }
 
     /// Open a TurboPersistence database at the given path.
@@ -807,6 +899,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         rebuild_shard_index(&self.config, inner);
         inner.current_sequence_number = current;
         self.is_empty.store(inner.is_empty(), Ordering::Relaxed);
+        self.spawn_eager_sst_opens(self.inner.read().meta_files_by_family.iter().flatten());
         Ok(true)
     }
 
@@ -976,8 +1069,9 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         }
     }
 
-    /// Prefetches all SST files which are usually lazy loaded. This can be used to reduce latency
-    /// for the first queries after opening the database.
+    /// Opens all SST files that aren't open yet, and waits for them. SST files are opened eagerly
+    /// in the background anyway, so this only makes a difference when the caller needs them all
+    /// open before it continues.
     pub fn prepare_all_sst_caches(&self) {
         for meta in self.inner.write().meta_files_by_family.iter_mut().flatten() {
             meta.prepare_sst_cache();
@@ -1369,6 +1463,10 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                 eprintln!("turbo-persistence: failed to write LOG after commit {seq:08}: {e:#}");
             }
         }
+
+        // Start opening the SST files of the new meta files in the background. The entries keep
+        // their SST slots when their meta files move into `inner` below, so the opens land there.
+        self.spawn_eager_sst_opens(new_meta_files.iter());
 
         // ── Phase C: structurally update inner (CURRENT is already durable). ──
         //

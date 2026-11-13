@@ -36,6 +36,10 @@ impl ParallelScheduler for RayonParallelScheduler {
         rayon::current_num_threads()
     }
 
+    fn spawn_blocking(&self, f: impl FnOnce() + Send + 'static) {
+        rayon::spawn(f);
+    }
+
     fn parallel_for_each<T>(&self, items: &[T], f: impl Fn(&T) + Send + Sync)
     where
         T: Sync,
@@ -3610,5 +3614,401 @@ fn batch_get_callback_error_propagates(#[case] mmap: bool) -> Result<()> {
         }
     }
     db.shutdown();
+    Ok(())
+}
+
+/// Writes `commits` commits of `KEYS_PER_COMMIT` keys each, so the database has at least one SST
+/// file per commit. Key `(commit, i)` maps to the value `[commit]`.
+fn write_eager_open_commits<S: ParallelSchedulerTrait>(
+    db: &TurboPersistence<S, 1>,
+    commits: u8,
+) -> Result<()> {
+    for commit in 0..commits {
+        write_eager_open_commit(db, commit)?;
+    }
+    Ok(())
+}
+
+/// Writes commit number `commit` of [`write_eager_open_commits`].
+fn write_eager_open_commit<S: ParallelSchedulerTrait>(
+    db: &TurboPersistence<S, 1>,
+    commit: u8,
+) -> Result<()> {
+    let batch = db.write_batch::<Vec<u8>>()?;
+    for i in 0..EAGER_OPEN_KEYS_PER_COMMIT {
+        batch.put(0, eager_open_key(commit, i), vec![commit].into())?;
+    }
+    db.commit_write_batch(batch)?;
+    Ok(())
+}
+
+/// Fewer keys under Miri, which interprets every write and lookup.
+const EAGER_OPEN_KEYS_PER_COMMIT: u32 = if cfg!(miri) { 4 } else { 100 };
+
+fn eager_open_key(commit: u8, i: u32) -> Vec<u8> {
+    let mut key = vec![commit];
+    key.extend_from_slice(&i.to_be_bytes());
+    key
+}
+
+fn check_eager_open_commits<S: ParallelSchedulerTrait>(
+    db: &TurboPersistence<S, 1>,
+    commits: u8,
+) -> Result<()> {
+    for commit in 0..commits {
+        for i in 0..EAGER_OPEN_KEYS_PER_COMMIT {
+            assert_eq!(
+                db.get(0, &eager_open_key(commit, i))?.as_deref(),
+                Some(&[commit][..]),
+                "key {i} of commit {commit}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn assert_all_ssts_open<S: ParallelSchedulerTrait>(db: &TurboPersistence<S, 1>) {
+    let states = db.sst_open_states();
+    assert!(!states.is_empty(), "the database has no SST files");
+    let closed: Vec<u32> = states
+        .iter()
+        .filter(|(_, open)| !open)
+        .map(|(seq, _)| *seq)
+        .collect();
+    assert!(
+        closed.is_empty(),
+        "SST files {closed:?} were not opened eagerly"
+    );
+}
+
+#[rstest]
+#[case::mmap(true)]
+#[case::file(false)]
+fn eager_sst_open_on_db_open(#[case] mmap: bool) -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let path = tempdir.path();
+    {
+        let db = open_db::<1>(path, mmap)?;
+        write_eager_open_commits(&db, 3)?;
+        db.shutdown();
+    }
+    let db = open_db::<1>(path, mmap)?;
+    db.wait_for_eager_sst_opens();
+    // No lookup ran, so every SST file was opened in the background.
+    assert!(db.sst_open_states().len() >= 3);
+    assert_all_ssts_open(&db);
+    check_eager_open_commits(&db, 3)?;
+    db.shutdown();
+    Ok(())
+}
+
+#[rstest]
+#[case::mmap(true)]
+#[case::file(false)]
+fn eager_sst_open_after_commit_and_compaction(#[case] mmap: bool) -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let db = open_db::<1>(tempdir.path(), mmap)?;
+    assert!(db.sst_open_states().is_empty());
+
+    write_eager_open_commits(&db, 3)?;
+    db.wait_for_eager_sst_opens();
+    assert_all_ssts_open(&db);
+
+    let before = db.sst_open_states();
+    assert!(db.compact(&CompactConfig::full())?.is_some());
+    db.wait_for_eager_sst_opens();
+    // Compaction closes every SST file and replaces the compacted ones. The files it wrote are
+    // opened eagerly.
+    let after = db.sst_open_states();
+    assert!(
+        after
+            .iter()
+            .all(|(seq, _)| !before.iter().any(|(old, _)| old == seq)),
+        "a full compaction replaces every SST file: {before:?} -> {after:?}"
+    );
+    assert_all_ssts_open(&db);
+    check_eager_open_commits(&db, 3)?;
+    db.shutdown();
+    Ok(())
+}
+
+type QueuedTask = Box<dyn FnOnce() + Send>;
+
+/// A scheduler that queues [`ParallelSchedulerTrait::spawn_blocking`] tasks until the test runs
+/// them, so tests control exactly when background SST opens happen. Everything else runs on
+/// [`RayonParallelScheduler`].
+#[derive(Clone, Default)]
+struct QueuedScheduler {
+    queue: std::sync::Arc<std::sync::Mutex<Vec<QueuedTask>>>,
+}
+
+impl QueuedScheduler {
+    fn take(&self) -> Vec<QueuedTask> {
+        std::mem::take(&mut *self.queue.lock().unwrap())
+    }
+
+    fn run_all(&self) {
+        for task in self.take() {
+            task();
+        }
+    }
+
+    fn queued(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+}
+
+impl ParallelSchedulerTrait for QueuedScheduler {
+    fn parallelism(&self) -> usize {
+        RayonParallelScheduler.parallelism()
+    }
+
+    fn spawn_blocking(&self, f: impl FnOnce() + Send + 'static) {
+        self.queue.lock().unwrap().push(Box::new(f));
+    }
+
+    fn parallel_for_each<T>(&self, items: &[T], f: impl Fn(&T) + Send + Sync)
+    where
+        T: Sync,
+    {
+        RayonParallelScheduler.parallel_for_each(items, f)
+    }
+
+    fn try_parallel_for_each<'l, T, E>(
+        &self,
+        items: &'l [T],
+        f: impl (Fn(&'l T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Sync,
+        E: Send + 'static,
+    {
+        RayonParallelScheduler.try_parallel_for_each(items, f)
+    }
+
+    fn try_parallel_for_each_mut<'l, T, E>(
+        &self,
+        items: &'l mut [T],
+        f: impl (Fn(&'l mut T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send + 'static,
+    {
+        RayonParallelScheduler.try_parallel_for_each_mut(items, f)
+    }
+
+    fn try_parallel_for_each_task_mut<T, E>(
+        &self,
+        items: &mut [T],
+        f: impl (Fn(&mut T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send + 'static,
+    {
+        RayonParallelScheduler.try_parallel_for_each_task_mut(items, f)
+    }
+
+    fn try_parallel_for_each_owned<T, E>(
+        &self,
+        items: Vec<T>,
+        f: impl (Fn(T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send + 'static,
+    {
+        RayonParallelScheduler.try_parallel_for_each_owned(items, f)
+    }
+
+    fn parallel_map_collect<'l, Item, PerItemResult, Result>(
+        &self,
+        items: &'l [Item],
+        f: impl Fn(&'l Item) -> PerItemResult + Send + Sync,
+    ) -> Result
+    where
+        Item: Sync,
+        PerItemResult: Send + Sync + 'l,
+        Result: FromIterator<PerItemResult>,
+    {
+        RayonParallelScheduler.parallel_map_collect(items, f)
+    }
+
+    fn parallel_map_collect_owned<Item, PerItemResult, Result>(
+        &self,
+        items: Vec<Item>,
+        f: impl Fn(Item) -> PerItemResult + Send + Sync,
+    ) -> Result
+    where
+        Item: Send + Sync,
+        PerItemResult: Send + Sync,
+        Result: FromIterator<PerItemResult>,
+    {
+        RayonParallelScheduler.parallel_map_collect_owned(items, f)
+    }
+}
+
+fn open_queued_db(
+    path: &Path,
+    mmap: bool,
+) -> Result<(TurboPersistence<QueuedScheduler, 1>, QueuedScheduler)> {
+    let scheduler = QueuedScheduler::default();
+    let db = TurboPersistence::open_with_config_and_parallel_scheduler(
+        path.to_path_buf(),
+        config_with_mmap(mmap),
+        scheduler.clone(),
+    )?;
+    Ok((db, scheduler))
+}
+
+#[rstest]
+#[case::mmap(true)]
+#[case::file(false)]
+fn eager_sst_open_runs_in_background(#[case] mmap: bool) -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let path = tempdir.path();
+    {
+        let db = open_db::<1>(path, mmap)?;
+        write_eager_open_commits(&db, 3)?;
+        db.shutdown();
+    }
+
+    // Opening the database returns while the opens are still queued.
+    let (db, scheduler) = open_queued_db(path, mmap)?;
+    assert!(scheduler.queued() > 0);
+    assert!(db.sst_open_states().iter().all(|(_, open)| !open));
+
+    // A lookup that comes first opens the SST file it needs itself. The newest commit is found in
+    // its own SST file, which lookups consult first.
+    for i in 0..EAGER_OPEN_KEYS_PER_COMMIT {
+        assert_eq!(db.get(0, &eager_open_key(2, i))?.as_deref(), Some(&[2][..]));
+    }
+    assert!(db.sst_open_states().iter().any(|(_, open)| *open));
+
+    // The queued opens skip that file and open the rest.
+    scheduler.run_all();
+    assert_all_ssts_open(&db);
+    check_eager_open_commits(&db, 3)?;
+
+    // A commit also returns while the opens of its SST files are still queued.
+    let before = db.sst_open_states();
+    write_eager_open_commit(&db, 3)?;
+    assert!(scheduler.queued() > 0);
+    let added: Vec<(u32, bool)> = db
+        .sst_open_states()
+        .into_iter()
+        .filter(|state| !before.contains(state))
+        .collect();
+    assert!(!added.is_empty());
+    assert!(added.iter().all(|(_, open)| !open), "{added:?}");
+    scheduler.run_all();
+    assert_all_ssts_open(&db);
+    check_eager_open_commits(&db, 4)?;
+    db.shutdown();
+    Ok(())
+}
+
+#[rstest]
+#[case::mmap(true)]
+#[case::file(false)]
+fn eager_sst_open_skips_cleared_retired_and_dropped_entries(#[case] mmap: bool) -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let path = tempdir.path();
+    {
+        let db = open_db::<1>(path, mmap)?;
+        write_eager_open_commits(&db, 3)?;
+        db.shutdown();
+    }
+
+    // Opens queued before the cache was cleared don't re-populate it.
+    {
+        let (db, scheduler) = open_queued_db(path, mmap)?;
+        db.clear_cache();
+        scheduler.run_all();
+        assert!(db.sst_open_states().iter().all(|(_, open)| !open));
+        check_eager_open_commits(&db, 3)?;
+        db.shutdown();
+    }
+
+    // Opens queued for SST files that compaction retired skip them. Only the files compaction
+    // wrote are opened.
+    {
+        let (db, scheduler) = open_queued_db(path, mmap)?;
+        let before = db.sst_open_states();
+        assert!(db.compact(&CompactConfig::full())?.is_some());
+        scheduler.run_all();
+        let after = db.sst_open_states();
+        assert!(
+            after
+                .iter()
+                .all(|(seq, _)| !before.iter().any(|(old, _)| old == seq)),
+            "a full compaction replaces every SST file: {before:?} -> {after:?}"
+        );
+        assert_all_ssts_open(&db);
+        check_eager_open_commits(&db, 3)?;
+        db.shutdown();
+    }
+
+    // Opens that run after the database was dropped do nothing.
+    {
+        let (db, scheduler) = open_queued_db(path, mmap)?;
+        let tasks = scheduler.take();
+        assert!(!tasks.is_empty());
+        drop(db);
+        for task in tasks {
+            task();
+        }
+    }
+
+    let db = open_db::<1>(path, mmap)?;
+    check_eager_open_commits(&db, 3)?;
+    db.shutdown();
+    Ok(())
+}
+
+#[rstest]
+#[case::mmap(true)]
+#[case::file(false)]
+fn eager_sst_open_failure_falls_back_to_lazy_open(#[case] mmap: bool) -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let path = tempdir.path();
+    {
+        let db = open_db::<1>(path, mmap)?;
+        write_eager_open_commits(&db, 3)?;
+        db.shutdown();
+    }
+    // Truncate the oldest SST file (of the first commit), so opening it fails.
+    let mut ssts: Vec<u32> = fs::read_dir(path)?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "sst").then(|| path.file_stem()?.to_str()?.parse().ok())?
+        })
+        .collect();
+    ssts.sort_unstable();
+    let broken = ssts[0];
+    fs::File::options()
+        .write(true)
+        .open(path.join(format!("{broken:08}.sst")))?
+        .set_len(0)?;
+
+    // Neither opening the database nor the failed background open reports an error.
+    let db = open_db::<1>(path, mmap)?;
+    db.wait_for_eager_sst_opens();
+    for (seq, open) in db.sst_open_states() {
+        assert_eq!(open, seq != broken, "SST {seq:08} (broken: {broken:08})");
+    }
+    // The newest commit is found in its own SST file, before the broken one is consulted.
+    for i in 0..EAGER_OPEN_KEYS_PER_COMMIT {
+        assert_eq!(db.get(0, &eager_open_key(2, i))?.as_deref(), Some(&[2][..]));
+    }
+    // A lookup that needs the broken file opens it lazily and reports why that fails.
+    let error = db
+        .get(0, &eager_open_key(0, 0))
+        .expect_err("the broken SST file must fail to open");
+    assert!(
+        format!("{error:#}").contains("Unable to open static sorted file"),
+        "unexpected error: {error:#}"
+    );
     Ok(())
 }
